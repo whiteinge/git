@@ -817,6 +817,7 @@ int cmd_main(int argc, const char **argv)
 	const char *cmd;
 	int done_help = 0;
 
+	strip_extension(argv);
 	cmd = argv[0];
 	if (!cmd)
 		cmd = "git-help";
@@ -838,12 +839,11 @@ int cmd_main(int argc, const char **argv)
 	 * So we just directly call the builtin handler, and die if
 	 * that one cannot handle it.
 	 */
-	if (skip_prefix(cmd, "git-", &cmd)) {
-		warn_on_dashed_git(argv[0]);
+	if (skip_prefix(cmd, "git-", &argv[0])) {
+		warn_on_dashed_git(cmd);
 
-		argv[0] = cmd;
 		handle_builtin(argc, argv);
-		die(_("cannot handle %s as a builtin"), cmd);
+		die(_("cannot handle %s as a builtin"), argv[0]);
 	}
 
 	/* Look for flags.. */
