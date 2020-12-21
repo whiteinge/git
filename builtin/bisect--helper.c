@@ -31,6 +31,7 @@ static const char * const git_bisect_helper_usage[] = {
 	N_("git bisect--helper --bisect-auto-next"),
 	N_("git bisect--helper --bisect-state (bad|new) [<rev>]"),
 	N_("git bisect--helper --bisect-state (good|old) [<rev>...]"),
+	N_("git bisect--helper --bisect-replay <filename>"),
 	NULL
 };
 
@@ -916,6 +917,121 @@ static enum bisect_error bisect_log(void)
 	return status ? BISECT_FAILED : BISECT_OK;
 }
 
+static int get_next_word(const char *line, int pos, struct strbuf *word)
+{
+	int i, len = strlen(line), begin = 0;
+
+	strbuf_reset(word);
+	for (i = pos; i < len; i++) {
+		if (line[i] == ' ' && begin)
+			return i + 1;
+
+		if (!begin)
+			begin = 1;
+		strbuf_addch(word, line[i]);
+	}
+
+	return i;
+}
+
+static int process_line(struct bisect_terms *terms, struct strbuf *line, struct strbuf *word)
+{
+	int res = 0;
+	int pos = 0;
+
+	while (pos < line->len) {
+		pos = get_next_word(line->buf, pos, word);
+
+		if (!strcmp(word->buf, "git"))
+			continue;
+		else if (!strcmp(word->buf, "git-bisect"))
+			continue;
+		else if (!strcmp(word->buf, "bisect"))
+			continue;
+		else if (starts_with(word->buf, "#"))
+			break;
+
+		get_terms(terms);
+		if (check_and_set_terms(terms, word->buf))
+			return -1;
+
+		if (!strcmp(word->buf, "start")) {
+			struct strvec argv = STRVEC_INIT;
+			int res;
+			sq_dequote_to_strvec(line->buf+pos, &argv);
+			res = bisect_start(terms, argv.v, argv.nr);
+			strvec_clear(&argv);
+			if (res)
+				return -1;
+			break;
+		}
+
+		if (one_of(word->buf, terms->term_good,
+			   terms->term_bad, "skip", NULL)) {
+			if (bisect_write(word->buf, line->buf+pos, terms, 0))
+				return -1;
+			break;
+		}
+
+		if (!strcmp(word->buf, "terms")) {
+			struct strvec argv = STRVEC_INIT;
+			int res;
+			sq_dequote_to_strvec(line->buf+pos, &argv);
+			res = bisect_terms(terms, argv.nr == 1 ? argv.v[0] : NULL);
+			strvec_clear(&argv);
+			if (res)
+				return -1;
+			break;
+		}
+
+		error(_("Replay file contains rubbish (\"%s\")"),
+		      word->buf);
+		res = -1;
+	}
+	return res;
+}
+
+static int process_replay_file(FILE *fp, struct bisect_terms *terms)
+{
+	struct strbuf line = STRBUF_INIT;
+	struct strbuf word = STRBUF_INIT;
+	int res = 0;
+
+	while (strbuf_getline(&line, fp) != EOF) {
+		res = process_line(terms, &line, &word);
+		if (res)
+			break;
+	}
+
+	strbuf_release(&line);
+	strbuf_release(&word);
+	return res;
+}
+
+static enum bisect_error bisect_replay(struct bisect_terms *terms, const char *filename)
+{
+	FILE *fp = NULL;
+	enum bisect_error res = BISECT_OK;
+
+	if (is_empty_or_missing_file(filename))
+		return error(_("cannot read file '%s' for replaying"), filename);
+
+	if (bisect_reset(NULL))
+		return BISECT_FAILED;
+
+	fp = fopen(filename, "r");
+	if (!fp)
+		return BISECT_FAILED;
+
+	res = process_replay_file(fp, terms);
+	fclose(fp);
+
+	if (res)
+		return BISECT_FAILED;
+
+	return bisect_auto_next(terms, NULL);
+}
+
 int cmd_bisect__helper(int argc, const char **argv, const char *prefix)
 {
 	enum {
@@ -929,7 +1045,8 @@ int cmd_bisect__helper(int argc, const char **argv, const char *prefix)
 		BISECT_NEXT,
 		BISECT_AUTO_NEXT,
 		BISECT_STATE,
-		BISECT_LOG
+		BISECT_LOG,
+		BISECT_REPLAY
 	} cmdmode = 0;
 	int res = 0, nolog = 0;
 	struct option options[] = {
@@ -953,6 +1070,8 @@ int cmd_bisect__helper(int argc, const char **argv, const char *prefix)
 			 N_("mark the state of ref (or refs)"), BISECT_STATE),
 		OPT_CMDMODE(0, "bisect-log", &cmdmode,
 			 N_("output the contents of BISECT_LOG"), BISECT_LOG),
+		OPT_CMDMODE(0, "bisect-replay", &cmdmode,
+			 N_("replay the bisection process from the given file"), BISECT_REPLAY),
 		OPT_BOOL(0, "no-log", &nolog,
 			 N_("no log for BISECT_WRITE")),
 		OPT_END()
@@ -1019,6 +1138,12 @@ int cmd_bisect__helper(int argc, const char **argv, const char *prefix)
 		if (argc)
 			return error(_("--bisect-log requires 0 arguments"));
 		res = bisect_log();
+		break;
+	case BISECT_REPLAY:
+		if (argc != 1)
+			return error(_("no logfile given"));
+		set_terms(&terms, "bad", "good");
+		res = bisect_replay(&terms, argv[0]);
 		break;
 	default:
 		BUG("unknown subcommand %d", cmdmode);
