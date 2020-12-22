@@ -455,7 +455,8 @@ struct ref **get_remote_refs(int fd_out, struct packet_reader *reader,
 			     struct ref **list, int for_push,
 			     const struct strvec *ref_prefixes,
 			     const struct string_list *server_options,
-			     int stateless_rpc)
+			     int stateless_rpc,
+			     char **unborn_head_target)
 {
 	int i;
 	const char *hash_name;
@@ -496,6 +497,8 @@ struct ref **get_remote_refs(int fd_out, struct packet_reader *reader,
 
 	/* Process response from server */
 	while (packet_reader_read(reader) == PACKET_READ_NORMAL) {
+		if (unborn_head_target)
+			BUG("NEEDSWORK: provide unborn HEAD target to caller while reading refs");
 		if (!process_ref_v2(reader, &list))
 			die(_("invalid ls-refs response: %s"), reader->line);
 	}
