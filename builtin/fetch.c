@@ -63,6 +63,7 @@ static int enable_auto_gc = 1;
 static int tags = TAGS_DEFAULT, unshallow, update_shallow, deepen;
 static int max_jobs = -1, submodule_fetch_jobs_config = -1;
 static int fetch_parallel_config = 1;
+static int atomic_fetch;
 static enum transport_family family;
 static const char *depth;
 static const char *deepen_since;
@@ -144,6 +145,8 @@ static struct option builtin_fetch_options[] = {
 		 N_("set upstream for git pull/fetch")),
 	OPT_BOOL('a', "append", &append,
 		 N_("append to .git/FETCH_HEAD instead of overwriting")),
+	OPT_BOOL(0, "atomic", &atomic_fetch,
+		 N_("use atomic transaction to update references")),
 	OPT_STRING(0, "upload-pack", &upload_pack, N_("path"),
 		   N_("path to upload pack on remote end")),
 	OPT__FORCE(&force, N_("force overwrite of local reference"), 0),
@@ -913,6 +916,7 @@ static int iterate_ref_map(void *cb_data, struct object_id *oid)
 
 struct fetch_head {
 	FILE *fp;
+	struct strbuf buf;
 };
 
 static int open_fetch_head(struct fetch_head *fetch_head)
@@ -922,6 +926,7 @@ static int open_fetch_head(struct fetch_head *fetch_head)
 	if (!write_fetch_head)
 		return 0;
 
+	strbuf_init(&fetch_head->buf, 0);
 	fetch_head->fp = fopen(filename, "a");
 	if (!fetch_head->fp)
 		return error_errno(_("cannot open %s"), filename);
@@ -938,19 +943,34 @@ static void append_fetch_head(struct fetch_head *fetch_head, const char *old_oid
 	if (!write_fetch_head)
 		return;
 
-	fprintf(fetch_head->fp, "%s\t%s\t%s",
-		old_oid, merge_status_marker, note);
-	for (i = 0; i < url_len; ++i)
-		if ('\n' == url[i])
-			fputs("\\n", fetch_head->fp);
-		else
-			fputc(url[i], fetch_head->fp);
-	fputc('\n', fetch_head->fp);
+	/*
+	 * When using an atomic fetch, we do not want to update FETCH_HEAD if
+	 * any of the reference updates fails. We thus have to write all
+	 * updates to a buffer first and only commit it as soon as all
+	 * references have been successfully updated.
+	 */
+	if (atomic_fetch) {
+		strbuf_addf(&fetch_head->buf, "%s\t%s\t%s",
+			    old_oid, merge_status_marker, note);
+		strbuf_add(&fetch_head->buf, url, url_len);
+		strbuf_addch(&fetch_head->buf, '\n');
+	} else {
+		fprintf(fetch_head->fp, "%s\t%s\t%s",
+			old_oid, merge_status_marker, note);
+		for (i = 0; i < url_len; ++i)
+			if ('\n' == url[i])
+				fputs("\\n", fetch_head->fp);
+			else
+				fputc(url[i], fetch_head->fp);
+		fputc('\n', fetch_head->fp);
+	}
 }
 
 static void commit_fetch_head(struct fetch_head *fetch_head)
 {
-	/* Nothing to commit yet. */
+	if (!write_fetch_head || !atomic_fetch)
+		return;
+	strbuf_write(&fetch_head->buf, fetch_head->fp);
 }
 
 static void close_fetch_head(struct fetch_head *fetch_head)
@@ -959,6 +979,7 @@ static void close_fetch_head(struct fetch_head *fetch_head)
 		return;
 
 	fclose(fetch_head->fp);
+	strbuf_release(&fetch_head->buf);
 }
 
 static const char warn_show_forced_updates[] =
@@ -976,7 +997,8 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 	struct fetch_head fetch_head;
 	struct commit *commit;
 	int url_len, i, rc = 0;
-	struct strbuf note = STRBUF_INIT;
+	struct strbuf note = STRBUF_INIT, err = STRBUF_INIT;
+	struct ref_transaction *transaction = NULL;
 	const char *what, *kind;
 	struct ref *rm;
 	char *url;
@@ -998,6 +1020,14 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 		rm = ref_map;
 		if (check_connected(iterate_ref_map, &rm, &opt)) {
 			rc = error(_("%s did not send all necessary objects\n"), url);
+			goto abort;
+		}
+	}
+
+	if (atomic_fetch) {
+		transaction = ref_transaction_begin(&err);
+		if (!transaction) {
+			error("%s", err.buf);
 			goto abort;
 		}
 	}
@@ -1089,7 +1119,7 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 
 			strbuf_reset(&note);
 			if (ref) {
-				rc |= update_local_ref(ref, NULL, what,
+				rc |= update_local_ref(ref, transaction, what,
 						       rm, &note, summary_width);
 				free(ref);
 			} else if (write_fetch_head || dry_run) {
@@ -1115,6 +1145,14 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 		}
 	}
 
+	if (!rc && transaction) {
+		rc = ref_transaction_commit(transaction, &err);
+		if (rc) {
+			error("%s", err.buf);
+			goto abort;
+		}
+	}
+
 	if (!rc)
 		commit_fetch_head(&fetch_head);
 
@@ -1134,6 +1172,8 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 
  abort:
 	strbuf_release(&note);
+	strbuf_release(&err);
+	ref_transaction_free(transaction);
 	free(url);
 	close_fetch_head(&fetch_head);
 	return rc;
@@ -1944,6 +1984,10 @@ int cmd_fetch(int argc, const char **argv, const char *prefix)
 		if (filter_options.choice)
 			die(_("--filter can only be used with the remote "
 			      "configured in extensions.partialclone"));
+
+		if (atomic_fetch)
+			die(_("--atomic can only be used when fetching "
+			      "from one remote"));
 
 		if (stdin_refspecs)
 			die(_("--stdin can only be used when fetching "
